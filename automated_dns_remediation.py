@@ -50,6 +50,7 @@ def get_monitored_devices():
 def run_ssh(host, port, username, password, command, timeout=8):
     try:
         import paramiko
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
@@ -70,10 +71,10 @@ def run_ssh(host, port, username, password, command, timeout=8):
             stdout.close()
             stderr.close()
 
-            # Ignore normal non-interactive VyOS terminal noise on stderr
             clean_err = "\n".join([
                 line for line in err.splitlines()
-                if "inappropriate ioctl" not in line.lower() and "no job control" not in line.lower()
+                if "inappropriate ioctl" not in line.lower()
+                and "no job control" not in line.lower()
             ]).strip()
 
             if out.strip():
@@ -93,14 +94,15 @@ def run_ssh(host, port, username, password, command, timeout=8):
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", f"ConnectTimeout={timeout}",
             "-p", str(port),
-            f"{username}@{host}", command
+            f"{username}@{host}", command,
         ]
         try:
             res = subprocess.run(command_args, capture_output=True, text=True, timeout=timeout + 4)
             out = res.stdout if res.stdout.strip() else res.stderr
             clean_out = "\n".join([
                 line for line in out.splitlines()
-                if "inappropriate ioctl" not in line.lower() and "no job control" not in line.lower()
+                if "inappropriate ioctl" not in line.lower()
+                and "no job control" not in line.lower()
             ]).strip()
             return (res.returncode == 0, clean_out)
         except Exception as exc:
@@ -123,9 +125,6 @@ def get_tickets():
 
 
 def find_dns_ticket(tickets, device):
-    """
-    Precisely match ticket to device name to prevent false matches against Expected DNS IPs.
-    """
     name = device["Device Name"].strip().lower()
     ip = device["Device Address"].strip()
 
@@ -139,7 +138,6 @@ def find_dns_ticket(tickets, device):
         if "dns" not in title and "dns" not in desc:
             continue
 
-        # Strict device name matching (e.g., 'svr2' in 'dns setting altered - svr2')
         title_match = bool(re.search(rf"\b{re.escape(name)}\b", title))
         desc_match = bool(re.search(rf"\b{re.escape(name)}\s*\({re.escape(ip)}\)", desc))
 
@@ -154,7 +152,7 @@ def resolve_ticket(ticket_id, timestamp):
     payload = json.dumps({
         "status": "resolved",
         "resolution": f"DNS confirmed and restored to {', '.join(EXPECTED_DNS)}",
-        "updated_at": timestamp
+        "updated_at": timestamp,
     }).encode()
     headers = {
         "Content-Type": "application/json",
@@ -197,7 +195,7 @@ def send_alert_email(device, current_dns, timestamp):
     msg.attach(MIMEText(body, "plain"))
 
     if not SEND_EMAIL or not SMTP_SERVER:
-        print(f"    --> [EMAIL] Notification ready (dry run)")
+        print("    --> [EMAIL] Alert prepared (dry run)")
         return True
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as s:
@@ -218,18 +216,22 @@ def correct_dns(device):
     port = VYOS_SSH_PORT if is_vyos else 22
 
     if is_vyos:
-        cmd = f"""/bin/vbash -ic 'configure
-delete system name-server
-set system name-server {EXPECTED_DNS[0]}
-set system name-server {EXPECTED_DNS[1]}
-commit; save; exit'"""
+        cmd = (
+            "/bin/vbash -ic '"
+            "source /opt/vyatta/etc/env.sh 2>/dev/null; "
+            "configure; "
+            "delete system name-server; "
+            f"set system name-server {EXPECTED_DNS[0]}; "
+            f"set system name-server {EXPECTED_DNS[1]}; "
+            "commit; save; exit'"
+        )
         verify_cmd = "/bin/vbash -ic 'show configuration commands | match \"system name-server\"'"
     else:
         lines = "".join(f"nameserver {dns}\\n" for dns in EXPECTED_DNS)
         cmd = f"echo '{pw}' | sudo -S -p '' bash -c 'printf \"{lines}\" > /etc/resolv.conf'"
         verify_cmd = "cat /etc/resolv.conf"
 
-    success, _ = run_ssh(ip, port, user, pw, cmd, timeout=10)
+    success, _ = run_ssh(ip, port, user, pw, cmd, timeout=12)
     if not success:
         return False
 
@@ -286,7 +288,7 @@ def main():
 
         detected = [dns for dns in list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", output))) if not dns.startswith("127.")]
 
-        # If DNS is already correct
+        # DNS is already correct
         if set(detected) == set(EXPECTED_DNS):
             print(f"[+] {name:<8} ({ip:<15}) : OK ({', '.join(detected)})")
 
@@ -298,7 +300,7 @@ def main():
                     open_ticket["status"] = "resolved"
             continue
 
-        # If DNS is altered
+        # DNS is altered
         current_dns = ", ".join(detected) if detected else "None detected"
         print(f"[!] {name:<8} ({ip:<15}) : ALTERED ({current_dns})")
         send_alert_email(device, current_dns, timestamp)
@@ -306,7 +308,10 @@ def main():
         open_ticket = find_dns_ticket(tickets, device)
         ticket_id = open_ticket.get("id") or open_ticket.get("ticket_id") if open_ticket else None
 
-        print(f"    --> [REMEDIATE] Restoring /etc/resolv.conf...", end=" ", flush=True)
+        if ticket_id:
+            print(f"    --> [TICKET] Found existing ticket #{ticket_id}")
+
+        print("    --> [REMEDIATE] Restoring DNS...", end=" ", flush=True)
         if correct_dns(device):
             print("SUCCESS")
             if ticket_id and resolve_ticket(ticket_id, timestamp):
