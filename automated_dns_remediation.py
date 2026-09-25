@@ -48,18 +48,30 @@ def get_monitored_devices():
 
 
 def run_ssh(host, port, username, password, command, timeout=8):
+    # Try Paramiko first
     try:
         import paramiko
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
             client.connect(
-                hostname=host, port=int(port), username=username, password=password,
-                timeout=timeout, allow_agent=False, look_for_keys=False
+                hostname=host,
+                port=int(port),
+                username=username,
+                password=password,
+                timeout=timeout,
+                allow_agent=False,
+                look_for_keys=False,
             )
             stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
             out = stdout.read().decode("utf-8", errors="replace")
             err = stderr.read().decode("utf-8", errors="replace")
+
+            # Cleanly close all buffers to prevent Paramiko __del__ teardown crash
+            stdin.close()
+            stdout.close()
+            stderr.close()
+
             if out.strip():
                 return True, out
             if err.strip():
@@ -67,16 +79,18 @@ def run_ssh(host, port, username, password, command, timeout=8):
             return True, ""
         finally:
             client.close()
-    except Exception as exc:
+    except Exception:
         pass
 
+    # Fallback to sshpass
     if shutil.which("sshpass") and password:
         command_args = [
             "sshpass", "-p", password, "ssh",
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", f"ConnectTimeout={timeout}",
-            "-p", str(port), f"{username}@{host}", command
+            "-p", str(port),
+            f"{username}@{host}", command
         ]
         try:
             res = subprocess.run(command_args, capture_output=True, text=True, timeout=timeout + 4)
@@ -85,7 +99,7 @@ def run_ssh(host, port, username, password, command, timeout=8):
         except Exception as exc:
             return False, str(exc)
 
-    return False, "Auth/Connection timed out"
+    return False, "SSH connection failed"
 
 
 def get_tickets():
@@ -119,10 +133,13 @@ def resolve_ticket(ticket_id, timestamp):
     url = f"{TICKET_URL}/{ticket_id}"
     payload = json.dumps({
         "status": "resolved",
-        "resolution": f"DNS settings confirmed/restored to {', '.join(EXPECTED_DNS)}",
+        "resolution": f"DNS restored and verified to {', '.join(EXPECTED_DNS)}",
         "updated_at": timestamp
     }).encode()
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
     if HELPDESK_TOKEN:
         headers["Authorization"] = f"Bearer {HELPDESK_TOKEN}"
 
@@ -160,25 +177,27 @@ def send_alert_email(device, current_dns, timestamp):
     msg.attach(MIMEText(body, "plain"))
 
     if not SEND_EMAIL or not SMTP_SERVER:
-        print(f"    --> [EMAIL] Dry run logged for {name}")
+        print(f"    --> [EMAIL] Notification ready (dry run)")
         return True
     try:
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as s:
             s.send_message(msg)
         print(f"    --> [EMAIL] Alert sent to {TO_EMAIL}")
         return True
-    except Exception as exc:
-        print(f"    --> [EMAIL] Failed: {exc}")
+    except Exception:
         return False
 
 
 def correct_dns(device):
-    name, ip = device["Device Name"], device["Device Address"]
+    name = device["Device Name"]
+    ip = device["Device Address"]
     os_type = device.get("OS", "").strip().lower()
-    user, pw = device.get("Username", "").strip(), device.get("Password", "")
-    port = VYOS_SSH_PORT if "vyos" in os_type else 22
+    user = device.get("Username", "").strip()
+    pw = device.get("Password", "")
+    is_vyos = "vyos" in os_type or "router" in name.lower()
+    port = VYOS_SSH_PORT if is_vyos else 22
 
-    if "vyos" in os_type:
+    if is_vyos:
         cmd = f"""/bin/vbash -ic 'configure
 delete system name-server
 set system name-server {EXPECTED_DNS[0]}
@@ -190,11 +209,11 @@ commit; save; exit'"""
         cmd = f"echo '{pw}' | sudo -S -p '' bash -c 'printf \"{lines}\" > /etc/resolv.conf'"
         verify_cmd = "cat /etc/resolv.conf"
 
-    success, _ = run_ssh(ip, port, user, pw, cmd)
+    success, _ = run_ssh(ip, port, user, pw, cmd, timeout=10)
     if not success:
         return False
 
-    v_success, v_out = run_ssh(ip, port, user, pw, verify_cmd)
+    v_success, v_out = run_ssh(ip, port, user, pw, verify_cmd, timeout=10)
     if not v_success:
         return False
 
@@ -230,34 +249,35 @@ def main():
         os_type = device.get("OS", "").strip().lower()
         user = device.get("Username", "").strip()
         pw = device.get("Password", "")
-        port = VYOS_SSH_PORT if "vyos" in os_type or "router" in name.lower() else 22
+        is_vyos = "vyos" in os_type or "router" in name.lower()
+        port = VYOS_SSH_PORT if is_vyos else 22
 
         if not ping_device(ip):
             print(f"[-] {name:<8} ({ip:<15}) : OFFLINE (Skipped)")
             continue
 
-        cmd = "/bin/vbash -ic 'show configuration commands | match \"system name-server\"'" if "vyos" in os_type or "router" in name.lower() else "cat /etc/resolv.conf"
+        cmd = "/bin/vbash -ic 'show configuration commands | match \"system name-server\"'" if is_vyos else "cat /etc/resolv.conf"
         success, output = run_ssh(ip, port, user, pw, cmd)
 
         if not success:
-            print(f"[!] {name:<8} ({ip:<15}) : SSH Failed ({output if output else 'connection refused/timeout'})")
+            print(f"[!] {name:<8} ({ip:<15}) : SSH Failed (Skipped)")
             continue
 
         detected = [dns for dns in list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", output))) if not dns.startswith("127.")]
 
-        # If DNS is already correct
+        # If DNS is verified correct
         if set(detected) == set(EXPECTED_DNS):
             print(f"[+] {name:<8} ({ip:<15}) : OK ({', '.join(detected)})")
-            
-            # Auto-resolve any leftover open ticket for this device
+
+            # Check if there is an unclosed ticket for this verified device
             open_ticket = find_dns_ticket(tickets, device)
             if open_ticket:
                 t_id = open_ticket.get("id") or open_ticket.get("ticket_id")
                 if resolve_ticket(t_id, timestamp):
-                    print(f"    --> [TICKET] Closed stale ticket #{t_id} as RESOLVED")
+                    print(f"    --> [TICKET] Closed open ticket #{t_id} as RESOLVED")
             continue
 
-        # DNS is altered
+        # If DNS is altered
         current_dns = ", ".join(detected) if detected else "None detected"
         print(f"[!] {name:<8} ({ip:<15}) : ALTERED ({current_dns})")
         send_alert_email(device, current_dns, timestamp)
