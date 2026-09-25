@@ -48,7 +48,6 @@ def get_monitored_devices():
 
 
 def run_ssh(host, port, username, password, command, timeout=8):
-    # Try Paramiko first
     try:
         import paramiko
         client = paramiko.SSHClient()
@@ -67,22 +66,26 @@ def run_ssh(host, port, username, password, command, timeout=8):
             out = stdout.read().decode("utf-8", errors="replace")
             err = stderr.read().decode("utf-8", errors="replace")
 
-            # Cleanly close all buffers to prevent Paramiko __del__ teardown crash
             stdin.close()
             stdout.close()
             stderr.close()
 
+            # Ignore normal non-interactive VyOS terminal noise on stderr
+            clean_err = "\n".join([
+                line for line in err.splitlines()
+                if "inappropriate ioctl" not in line.lower() and "no job control" not in line.lower()
+            ]).strip()
+
             if out.strip():
                 return True, out
-            if err.strip():
-                return False, err
+            if clean_err:
+                return False, clean_err
             return True, ""
         finally:
             client.close()
     except Exception:
         pass
 
-    # Fallback to sshpass
     if shutil.which("sshpass") and password:
         command_args = [
             "sshpass", "-p", password, "ssh",
@@ -95,7 +98,11 @@ def run_ssh(host, port, username, password, command, timeout=8):
         try:
             res = subprocess.run(command_args, capture_output=True, text=True, timeout=timeout + 4)
             out = res.stdout if res.stdout.strip() else res.stderr
-            return (res.returncode == 0, out.strip())
+            clean_out = "\n".join([
+                line for line in out.splitlines()
+                if "inappropriate ioctl" not in line.lower() and "no job control" not in line.lower()
+            ]).strip()
+            return (res.returncode == 0, clean_out)
         except Exception as exc:
             return False, str(exc)
 
@@ -116,16 +123,29 @@ def get_tickets():
 
 
 def find_dns_ticket(tickets, device):
+    """
+    Precisely match ticket to device name to prevent false matches against Expected DNS IPs.
+    """
     name = device["Device Name"].strip().lower()
     ip = device["Device Address"].strip()
+
     for t in tickets:
         if str(t.get("status", "")).lower() == "resolved":
             continue
+
         title = str(t.get("title", "")).lower()
         desc = str(t.get("description", "")).lower()
-        if "dns" in title or "dns" in desc:
-            if name in title or name in desc or ip in desc:
-                return t
+
+        if "dns" not in title and "dns" not in desc:
+            continue
+
+        # Strict device name matching (e.g., 'svr2' in 'dns setting altered - svr2')
+        title_match = bool(re.search(rf"\b{re.escape(name)}\b", title))
+        desc_match = bool(re.search(rf"\b{re.escape(name)}\s*\({re.escape(ip)}\)", desc))
+
+        if title_match or desc_match:
+            return t
+
     return None
 
 
@@ -133,7 +153,7 @@ def resolve_ticket(ticket_id, timestamp):
     url = f"{TICKET_URL}/{ticket_id}"
     payload = json.dumps({
         "status": "resolved",
-        "resolution": f"DNS restored and verified to {', '.join(EXPECTED_DNS)}",
+        "resolution": f"DNS confirmed and restored to {', '.join(EXPECTED_DNS)}",
         "updated_at": timestamp
     }).encode()
     headers = {
@@ -260,21 +280,22 @@ def main():
         success, output = run_ssh(ip, port, user, pw, cmd)
 
         if not success:
-            print(f"[!] {name:<8} ({ip:<15}) : SSH Failed (Skipped)")
+            reason = "Port closed" if "connection refused" in str(output).lower() else "SSH Failed"
+            print(f"[!] {name:<8} ({ip:<15}) : {reason} (Skipped)")
             continue
 
         detected = [dns for dns in list(dict.fromkeys(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", output))) if not dns.startswith("127.")]
 
-        # If DNS is verified correct
+        # If DNS is already correct
         if set(detected) == set(EXPECTED_DNS):
             print(f"[+] {name:<8} ({ip:<15}) : OK ({', '.join(detected)})")
 
-            # Check if there is an unclosed ticket for this verified device
             open_ticket = find_dns_ticket(tickets, device)
             if open_ticket:
                 t_id = open_ticket.get("id") or open_ticket.get("ticket_id")
                 if resolve_ticket(t_id, timestamp):
                     print(f"    --> [TICKET] Closed open ticket #{t_id} as RESOLVED")
+                    open_ticket["status"] = "resolved"
             continue
 
         # If DNS is altered
@@ -290,6 +311,8 @@ def main():
             print("SUCCESS")
             if ticket_id and resolve_ticket(ticket_id, timestamp):
                 print(f"    --> [TICKET] #{ticket_id} updated to RESOLVED")
+                if open_ticket:
+                    open_ticket["status"] = "resolved"
         else:
             print("FAILED")
 
