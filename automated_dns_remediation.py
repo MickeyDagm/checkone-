@@ -41,11 +41,18 @@ def get_monitored_devices():
         addr = d.get("Device Address", "").strip()
         os_type = d.get("OS", "").strip().lower()
         user = d.get("Username", "").strip().lower()
-        if not has_static_ip(addr) or "switch" in os_type or user in ("", "none"):
+        name = d.get("Device Name", "").strip().lower()
+
+        # Check static IP and credentials
+        if not has_static_ip(addr) or user in ("", "none"):
             continue
+
+        # Skip switches and routers by OS or device name
+        if "switch" in os_type or "router" in os_type or "vyos" in os_type or "router" in name:
+            continue
+
         monitored.append(d)
     return monitored
-
 
 def run_ssh(host, port, username, password, command, timeout=8):
     try:
