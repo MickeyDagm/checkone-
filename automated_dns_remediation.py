@@ -1,45 +1,33 @@
-import csv
 import datetime
+import ipaddress
 import json
 import logging
 import os
 import re
+import shlex
 import smtplib
-import time
+import socket
 import urllib.error
 import urllib.request
 
 import paramiko
 from email.message import EmailMessage
-
 from config import (
-    HELPDESK_BASE_URL,
-    HELPDESK_TOKEN,
-    EXPECTED_DNS,
-    SMTP_SERVER,
-    SMTP_PORT,
-    FROM_EMAIL,
-    TO_EMAIL,
+    HELPDESK_BASE_URL, HELPDESK_TOKEN, EXPECTED_DNS, SMTP_SERVER,
+    SMTP_PORT, FROM_EMAIL, TO_EMAIL,
 )
 from enumerate_devices import enumerate_devices
 
-# ============================================================
-# PATHS / CONSTANTS
-# ============================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(SCRIPT_DIR, "network_devices.csv")
 TICKET_URL = f"{HELPDESK_BASE_URL.rstrip('/')}/api/tickets"
 LOG_FILE = os.path.join(SCRIPT_DIR, "dns_remediation.log")
 SSH_TIMEOUT = 10
+LAB_PASSWORD = "ubuntu"
+LINUX_OS = {"ubuntu", "linux", "debian"}
 
-# ============================================================
-# LOGGING
-# ============================================================
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+                    format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("dns-remediation")
 
 
@@ -48,198 +36,263 @@ def now():
 
 
 def normalize_dns(values):
-    """Return a clean list of unique IPv4 DNS addresses."""
+    """Validate addresses before comparison or inclusion in remote commands."""
     if isinstance(values, str):
-        values = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", values)
+        values = values.replace(",", " ").split()
     result = []
     for value in values:
-        value = str(value).strip()
-        if value and value not in result:
+        value = str(ipaddress.ip_address(str(value).strip()))
+        if value not in result:
             result.append(value)
     return result
 
 
-def dns_is_correct(current_dns):
-    """Compare current DNS to expected (order does not matter)."""
-    return set(normalize_dns(current_dns)) == set(normalize_dns(EXPECTED_DNS))
+EXPECTED_DNS = normalize_dns(EXPECTED_DNS)
+if not EXPECTED_DNS:
+    raise ValueError("config.EXPECTED_DNS must contain the lab DNS servers")
 
 
-# ============================================================
-# DEVICE SELECTION
-# ============================================================
+def dns_is_correct(current):
+    # Compare each scope separately: combining subnets can hide missing servers.
+    if isinstance(current, dict):
+        return bool(current) and all(dns_is_correct(v) for v in current.values())
+    return set(normalize_dns(current)) == set(EXPECTED_DNS)
+
+
+def dns_text(current):
+    if isinstance(current, dict):
+        return "; ".join(f"{k}: {', '.join(v) or 'None'}" for k, v in current.items())
+    return ", ".join(current) if current else "None detected"
+
+
+def is_vyos(device):
+    return (device["OS"].lower() == "vyos"
+            or device["Device Name"].upper() == "ROUTER1")
+
+
 def get_devices():
-    """Load devices and keep only those that can be SSH-monitored."""
-    devices = enumerate_devices(CSV_FILE)
-    monitored = []
-
-    for device in devices:
-        name = device["Device Name"].strip()
-        address = device["Device Address"].strip()
-        os_type = device["OS"].strip().lower()
-        username = device["Username"].strip()
-        password = device["Password"].strip()
-
-        if os_type in {"openvswitch", "ovs"}:
+    devices = []
+    for original in enumerate_devices(CSV_FILE):
+        device = dict(original)
+        for key in ("Device Name", "Device Address", "OS"):
+            device[key] = str(device.get(key) or "").strip()
+        name, address = device["Device Name"], device["Device Address"]
+        if device["OS"].lower() in {"openvswitch", "ovs"}:
+            print(f"[SKIP] {name}: unmanaged switch")
             continue
-        if not address or address.upper() in {"DHCP", "NONE"}:
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            print(f"[SKIP] {name}: enumerate_devices returned no usable IP ({address!r})")
             continue
-        if not username or username.lower() == "none":
+        if not is_vyos(device) and device["OS"].lower() not in LINUX_OS:
+            print(f"[SKIP] {name}: unsupported OS {device['OS']}")
             continue
-        if not password or password.lower() == "none":
-            continue
+        # Credentials confirmed for this lab, regardless of stale CSV values.
+        device["Username"] = "vyos" if is_vyos(device) else "ubuntu"
+        device["Password"] = LAB_PASSWORD
+        devices.append(device)
+    return devices
 
-        monitored.append(device)
 
-    return monitored
-
-
-# ============================================================
-# SSH HELPERS
-# ============================================================
 def connect(device):
-    """
-    SSH to the device on port 22 using Device Address.
-    Access Port is console/telnet — do not use it for Paramiko.
-    """
     client = paramiko.SSHClient()
+    client.load_system_host_keys()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    host = device["Device Address"].strip()
-    port = 22
-
-    # Optional: ROUTER1 via same settings as enumerate_devices
-    os_type = device["OS"].strip().lower()
-    name = device["Device Name"].strip().upper()
-    if os_type == "vyos" or name == "ROUTER1":
-        from config import VYOS_SSH_HOST, VYOS_SSH_PORT
-        host = VYOS_SSH_HOST
-        port = int(VYOS_SSH_PORT)
-
-    client.connect(
-        hostname=host,
-        port=port,
-        username=device["Username"],
-        password=device["Password"],
-        timeout=SSH_TIMEOUT,
-        auth_timeout=SSH_TIMEOUT,
-        banner_timeout=SSH_TIMEOUT,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+    try:
+        client.connect(hostname=device["Device Address"], port=22,
+                       username=device["Username"], password=device["Password"],
+                       timeout=SSH_TIMEOUT, auth_timeout=SSH_TIMEOUT,
+                       banner_timeout=SSH_TIMEOUT, look_for_keys=False,
+                       allow_agent=False)
+    except Exception:
+        client.close()
+        raise
     return client
 
-    
-def run_command(client, command):
-    stdin, stdout, stderr = client.exec_command(command, timeout=SSH_TIMEOUT)
+
+def run_command(client, command, input_text=None, timeout=SSH_TIMEOUT):
+    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+    if input_text is not None:
+        stdin.write(input_text)
+        stdin.flush()
+    stdin.channel.shutdown_write()
     output = stdout.read().decode("utf-8", errors="replace").strip()
     error = stderr.read().decode("utf-8", errors="replace").strip()
-    exit_code = stdout.channel.recv_exit_status()
-    return exit_code, output, error
+    return stdout.channel.recv_exit_status(), output, error
 
 
-# ============================================================
-# DNS - LINUX / UBUNTU
-# ============================================================
-def get_linux_dns(client):
-    code, output, error = run_command(client, "cat /etc/resolv.conf")
+def checked(client, command, input_text=None, timeout=SSH_TIMEOUT):
+    code, output, error = run_command(client, command, input_text, timeout)
     if code != 0:
-        raise RuntimeError(error or "Unable to read /etc/resolv.conf")
+        raise RuntimeError(error or output or f"Remote command failed (exit {code})")
+    return output
 
-    dns_servers = []
+
+def sudo(client, script, password):
+    # Only the password is sent on stdin; it cannot become resolver-file content.
+    return checked(client, "sudo -S -p '' sh -c " + shlex.quote(script),
+                   password + "\n", timeout=30)
+
+
+def parse_resolv_conf(output):
+    return normalize_dns([line.split()[1] for line in output.splitlines()
+                          if re.match(r"^\s*nameserver\s+\S+", line)])
+
+
+def parse_resolvectl(output):
+    groups = {}
     for line in output.splitlines():
-        line = line.strip()
-        if line.startswith("nameserver"):
-            parts = line.split()
-            if len(parts) >= 2:
-                dns_servers.append(parts[1])
-    return normalize_dns(dns_servers)
+        match = re.match(r"^Global:\s*(.*)$", line.strip())
+        if match:
+            groups["Global"] = normalize_dns(match.group(1))
+            continue
+        match = re.match(r"^Link\s+\d+\s+\(([^)]+)\):\s*(.*)$", line.strip())
+        if match:
+            groups["Link " + match.group(1)] = normalize_dns(match.group(2))
+    if not groups:
+        raise RuntimeError("Unrecognized resolvectl dns output; DNS was not checked")
+    return groups
+
+
+def linux_state(client):
+    conf = checked(client, "cat /etc/resolv.conf")
+    file_dns = parse_resolv_conf(conf)
+    target = checked(client, "readlink -f /etc/resolv.conf")
+    managed = (target.startswith("/run/systemd/resolve/")
+               or "managed by man:systemd-resolved" in conf)
+    code, output, error = run_command(client, "LC_ALL=C resolvectl dns")
+    groups = {}
+    if code == 0:
+        raw = parse_resolvectl(output)
+        groups = {k: v for k, v in raw.items() if v}
+        # Empty default-route links must also be checked. Empty unused links
+        # (e.g. bridges) should not be assigned DNS arbitrarily.
+        routes = json.loads(checked(client, "ip -j route show default"))
+        for route in routes:
+            interface = route.get("dev")
+            if interface and interface != "lo":
+                key = "Link " + interface
+                if key not in raw:
+                    raise RuntimeError(f"Default interface {interface} absent from resolvectl")
+                groups[key] = raw[key]
+        if not groups:
+            raise RuntimeError("No DNS-bearing or default-route interface found")
+    elif managed or any(ipaddress.ip_address(v).is_loopback for v in file_dns):
+        raise RuntimeError("Cannot read upstream DNS: resolvectl failed: " + (error or output))
+    # A regular resolver file may override systemd-resolved for applications.
+    # Check it too; do not mistake the managed 127.0.0.53 stub for bad DNS.
+    if not managed:
+        groups["resolv.conf"] = file_dns
+    return groups, target, managed
+
+
+def get_linux_dns(client):
+    return linux_state(client)[0]
 
 
 def set_linux_dns(client, password):
-    dns_content = "\n".join(f"nameserver {dns}" for dns in EXPECTED_DNS) + "\n"
-    command = "sudo -S -p '' tee /etc/resolv.conf > /dev/null"
+    groups, target, managed = linux_state(client)
+    servers = " ".join(shlex.quote(v) for v in EXPECTED_DNS)
+    for scope, values in groups.items():
+        if dns_is_correct(values):
+            continue
+        if scope.startswith("Link "):
+            sudo(client, f"resolvectl dns {shlex.quote(scope[5:])} {servers}", password)
+            print("    [NOTE] Ubuntu link DNS corrected at runtime; DHCP/reboot can replace it.")
+        elif scope == "Global":
+            # Setting link DNS does not remove incorrect global servers.
+            # Do not claim success when an unsupported global override remains.
+            raise RuntimeError("Unexpected global DNS override: correct DNS= in the "
+                               "systemd-resolved configuration, then rerun")
+        elif scope == "resolv.conf":
+            if managed or target != "/etc/resolv.conf":
+                raise RuntimeError("Resolver file is managed by another service; "
+                                   "correct that service's DNS configuration")
+            previous = checked(client, "cat /etc/resolv.conf")
+            retained = [line for line in previous.splitlines()
+                        if not re.match(r"^\s*nameserver\b", line)]
+            content = "\n".join(retained + [f"nameserver {v}" for v in EXPECTED_DNS]) + "\n"
+            script = ("set -e\ncp -p /etc/resolv.conf /etc/resolv.conf.dns-remediation.bak\n"
+                      "printf '%s' " + shlex.quote(content) + " > /etc/resolv.conf")
+            sudo(client, script, password)
 
-    stdin, stdout, stderr = client.exec_command(command, timeout=SSH_TIMEOUT)
-    stdin.write(password + "\n")
-    stdin.write(dns_content)
-    stdin.flush()
-    stdin.channel.shutdown_write()
 
-    exit_code = stdout.channel.recv_exit_status()
-    error = stderr.read().decode("utf-8", errors="replace").strip()
-    if exit_code != 0:
-        raise RuntimeError(error or "Failed to update DNS configuration")
-
-
-# ============================================================
-# DNS - VYOS
-# ============================================================
-def get_vyos_dns(client):
-    command = "show configuration commands | match 'system name-server'"
-    code, output, error = run_command(client, command)
-    if code != 0:
-        raise RuntimeError(error or "Unable to read VyOS DNS configuration")
-
-    dns_servers = []
+def parse_vyos_config(output):
+    """Discover all DHCP subnets, including ones with missing DNS options."""
+    scopes = {}
+    system = []
     for line in output.splitlines():
-        match = re.search(
-            r"system name-server\s+((?:\d{1,3}\.){3}\d{1,3})",
-            line,
-        )
-        if match:
-            dns_servers.append(match.group(1))
-    return normalize_dns(dns_servers)
+        tokens = shlex.split(line)
+        if tokens[:3] == ["set", "system", "name-server"]:
+            system.extend(normalize_dns(tokens[3:]))
+        if (len(tokens) < 7 or tokens[:4] !=
+                ["set", "service", "dhcp-server", "shared-network-name"]
+                or tokens[5] != "subnet"):
+            continue
+        prefix = tuple(tokens[1:7])
+        record = scopes.setdefault(prefix, {"option": ("option", "name-server"), "dns": []})
+        tail = tokens[7:]
+        if tail[:2] == ["option", "name-server"]:
+            record["dns"].extend(normalize_dns(tail[2:]))
+        elif tail[:1] == ["dns-server"]:
+            record["option"] = ("dns-server",)
+            record["dns"].extend(normalize_dns(tail[1:]))
+    if not scopes:
+        raise RuntimeError("No VyOS DHCP subnets found; cannot check DHCP DNS")
+    # Empty router system DNS is valid for this lab; it is distinct from DHCP.
+    return scopes, system
+
+
+def vyos_state(client):
+    output = checked(client, "/opt/vyatta/bin/vyatta-op-cmd-wrapper show configuration commands")
+    return parse_vyos_config(output)
+
+
+def get_vyos_dns(client):
+    scopes, system = vyos_state(client)
+    groups = {f"DHCP {p[3]} {p[5]}": r["dns"] for p, r in scopes.items()}
+    if system:
+        groups["system name-server"] = system
+    return groups
 
 
 def set_vyos_dns(client):
-    shell = client.invoke_shell()
-    shell.settimeout(SSH_TIMEOUT)
+    scopes, system = vyos_state(client)
+    changes = []
+    for prefix, record in scopes.items():
+        if dns_is_correct(record["dns"]):
+            continue
+        path = shlex.join(prefix + record["option"])
+        if record["dns"]:
+            changes.append(f"delete {path} || exit 1")
+        changes.extend(f"set {path} {shlex.quote(v)} || exit 1" for v in EXPECTED_DNS)
+    if system and not dns_is_correct(system):
+        changes.append("delete system name-server || exit 1")
+        changes.extend(f"set system name-server {shlex.quote(v)} || exit 1" for v in EXPECTED_DNS)
+    if not changes:
+        return
+    script = "\n".join([
+        "source /opt/vyatta/etc/functions/script-template || exit 1",
+        "configure || exit 1",
+        "trap 'exit discard >/dev/null 2>&1' EXIT",
+        *changes,
+        "commit || exit 1", "save || exit 1", "exit || exit 1", "trap - EXIT",
+    ])
+    # Run under the VyOS configuration group, never as root via sudo.
+    command = "sg vyattacfg -c " + shlex.quote("/bin/vbash -c " + shlex.quote(script))
+    checked(client, command, timeout=60)
 
-    def send(cmd, wait=1.5):
-        shell.send(cmd + "\n")
-        time.sleep(wait)
-        output = ""
-        while shell.recv_ready():
-            output += shell.recv(65535).decode("utf-8", errors="replace")
-        return output
 
-    try:
-        send("configure")
-        send("delete system name-server")
-        for dns in EXPECTED_DNS:
-            send(f"set system name-server {dns}")
-        commit_out = send("commit")
-        if "error" in commit_out.lower():
-            raise RuntimeError(f"VyOS commit failed: {commit_out}")
-        save_out = send("save")
-        if "error" in save_out.lower():
-            raise RuntimeError(f"VyOS save failed: {save_out}")
-        send("exit")
-    finally:
-        shell.close()
-
-
-# ============================================================
-# DNS DISPATCH
-# ============================================================
 def get_dns(device, client):
-    os_type = device["OS"].strip().lower()
-    if os_type in {"ubuntu", "linux", "debian"}:
-        return get_linux_dns(client)
-    if os_type == "vyos":
-        return get_vyos_dns(client)
-    raise RuntimeError(f"Unsupported OS: {device['OS']}")
+    return get_vyos_dns(client) if is_vyos(device) else get_linux_dns(client)
 
 
 def correct_dns(device, client):
-    os_type = device["OS"].strip().lower()
-    if os_type in {"ubuntu", "linux", "debian"}:
-        set_linux_dns(client, device["Password"])
-        return
-    if os_type == "vyos":
+    if is_vyos(device):
         set_vyos_dns(client)
-        return
-    raise RuntimeError(f"Unsupported OS: {device['OS']}")
+    else:
+        set_linux_dns(client, device["Password"])
 
 
 # ============================================================
@@ -252,7 +305,7 @@ def send_dns_alert(device, current_dns):
     """
     name = device["Device Name"]
     ip = device["Device Address"]
-    current_text = ", ".join(current_dns) if current_dns else "None detected"
+    current_text = dns_text(current_dns)
     expected_text = ", ".join(EXPECTED_DNS)
     detected_time = now()
 
@@ -332,7 +385,7 @@ def create_dns_ticket(device, current_dns):
     """Create a ticket for an altered DNS setting."""
     name = device["Device Name"]
     ip = device["Device Address"]
-    current_text = ", ".join(current_dns) if current_dns else "None detected"
+    current_text = dns_text(current_dns)
     expected_text = ", ".join(EXPECTED_DNS)
 
     payload = {
@@ -363,7 +416,7 @@ def create_dns_ticket(device, current_dns):
 
 def resolve_ticket(ticket, device):
     """Mark the DNS ticket as resolved after successful remediation."""
-    ticket_id = ticket.get("id")
+    ticket_id = ticket.get("id") or ticket.get("ticket_id")
     if ticket_id is None:
         raise RuntimeError("DNS ticket has no ID")
 
@@ -396,10 +449,10 @@ def resolve_ticket(ticket, device):
 # ============================================================
 def log_dns_ok(device, current_dns):
     msg = (
-        f"DNS service functioning correctly - "
+        f"DNS configuration matches expected settings - "
         f"Device: {device['Device Name']} - "
         f"Date/Time: {now()} - "
-        f"DNS: {','.join(current_dns)}"
+        f"DNS: {dns_text(current_dns)}"
     )
     logger.info(msg)
     print(f"    [LOG] {msg}")
@@ -419,7 +472,7 @@ def process_device(device):
     try:
         client = connect(device)
         current_dns = get_dns(device, client)
-        current_text = ", ".join(current_dns) if current_dns else "None detected"
+        current_text = dns_text(current_dns)
         expected_text = ", ".join(EXPECTED_DNS)
 
         # ----- DNS is correct -----
@@ -446,7 +499,12 @@ def process_device(device):
         send_dns_alert(device, current_dns)
 
         # 2. Create ticket
-        ticket = create_dns_ticket(device, current_dns)
+        ticket = None
+        try:
+            ticket = create_dns_ticket(device, current_dns)
+        except Exception as exc:
+            print(f"    [TICKET] Failed; continuing DNS correction: {exc}")
+            logger.error("TICKET CREATE FAILED | %s | %s", name, exc)
 
         # 3. Correct DNS
         print("    [REMEDIATE] Correcting DNS...")
@@ -456,7 +514,7 @@ def process_device(device):
         # 4. Verify
         print("    [VERIFY] Checking DNS again...")
         verified_dns = get_dns(device, client)
-        verified_text = ", ".join(verified_dns) if verified_dns else "None detected"
+        verified_text = dns_text(verified_dns)
         print(f"    [VERIFY] Current: {verified_text}")
 
         if not dns_is_correct(verified_dns):
@@ -473,9 +531,17 @@ def process_device(device):
         logger.info("DNS RESTORED | %s | %s | DNS=%s", name, ip, verified_text)
 
         # 5. Update ticket to resolved
-        resolve_ticket(ticket, device)
+        if ticket is not None:
+            resolve_ticket(ticket, device)
         return True
 
+    except (paramiko.ssh_exception.NoValidConnectionsError,
+            paramiko.AuthenticationException, paramiko.SSHException,
+            socket.timeout, OSError) as exc:
+        print(f"    [UNVERIFIED] SSH/connection error: {exc}")
+        print("    DNS could not be checked or corrected. This does not prove the host is offline.")
+        logger.error("DNS UNVERIFIED | %s | %s | %s", name, ip, exc)
+        return False
     except Exception as exc:
         print(f"    [ERROR] {type(exc).__name__}: {exc}")
         logger.error("DEVICE PROCESSING FAILED | %s | %s | %s", name, ip, exc)
@@ -514,9 +580,9 @@ def main():
     print("=" * 70)
     print("DNS REMEDIATION SUMMARY")
     print("=" * 70)
-    print(f"Devices checked : {len(devices)}")
+    print(f"Devices attempted: {len(devices)}")
     print(f"Successful      : {successful}")
-    print(f"Failed          : {failed}")
+    print(f"Failed/unverified: {failed}")
     print(f"Log file        : {LOG_FILE}")
     print("=" * 70)
 
