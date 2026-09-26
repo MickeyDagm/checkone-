@@ -97,11 +97,27 @@ def get_devices():
 # SSH HELPERS
 # ============================================================
 def connect(device):
+    """
+    SSH to the device on port 22 using Device Address.
+    Access Port is console/telnet — do not use it for Paramiko.
+    """
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    host = device["Device Address"].strip()
+    port = 22
+
+    # Optional: ROUTER1 via same settings as enumerate_devices
+    os_type = device["OS"].strip().lower()
+    name = device["Device Name"].strip().upper()
+    if os_type == "vyos" or name == "ROUTER1":
+        from config import VYOS_SSH_HOST, VYOS_SSH_PORT
+        host = VYOS_SSH_HOST
+        port = int(VYOS_SSH_PORT)
+
     client.connect(
-        hostname=device["Device Address"],
-        port=int(device["Access Port"]),
+        hostname=host,
+        port=port,
         username=device["Username"],
         password=device["Password"],
         timeout=SSH_TIMEOUT,
@@ -112,7 +128,7 @@ def connect(device):
     )
     return client
 
-
+    
 def run_command(client, command):
     stdin, stdout, stderr = client.exec_command(command, timeout=SSH_TIMEOUT)
     output = stdout.read().decode("utf-8", errors="replace").strip()

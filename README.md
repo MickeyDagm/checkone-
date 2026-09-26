@@ -7,3 +7,6 @@ curl -X POST "http://api.d522.wgu.internal:5000/api/tickets" -H "Authorization: 
 
 # Resolve it (replace ID)
 curl -X PATCH "http://api.d522.wgu.internal:5000/api/tickets/7" -H "Authorization: Bearer vGkbXkGLqQSo7YLflp9DutuG8st4xdPPF7wnTcwB0FE" -H "Content-Type: application/json" -d '{"status":"resolved"}'
+
+ssh -o StrictHostKeyChecking=no -p 22 ubuntu@10.10.10.10
+# password from CSV: ubuntu
