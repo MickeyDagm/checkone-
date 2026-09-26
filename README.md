@@ -10,3 +10,6 @@ curl -X PATCH "http://api.d522.wgu.internal:5000/api/tickets/7" -H "Authorizatio
 
 ssh -o StrictHostKeyChecking=no -p 22 ubuntu@10.10.10.10
 # password from CSV: ubuntu
+
+ssh -o StrictHostKeyChecking=no -p 22 ubuntu@192.168.10.102
+cat /etc/resolv.conf
