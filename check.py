@@ -49,3 +49,20 @@ done
 EOF
 chmod +x check_dns.sh
 ./check_dns.sh
+
+
+for ip in 10.10.10.1 10.10.10.100; do
+    echo "========== $ip =========="
+
+    if [ "$ip" = "10.10.10.1" ]; then
+        echo "ROUTER1 - VyOS"
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 vyos@$ip \
+            "hostname; show configuration commands | grep name-server; cat /etc/resolv.conf"
+    else
+        echo "SMTP - Ubuntu"
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ubuntu@$ip \
+            "hostname; resolvectl dns 2>/dev/null; cat /etc/resolv.conf"
+    fi
+
+    echo
+done
