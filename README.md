@@ -33,3 +33,7 @@ ssh -o StrictHostKeyChecking=no -p 22 vyos@10.10.10.1
 show system name-server
 # or
 show configuration commands | grep name-server
+
+
+
+sshpass -p "ubuntu" ssh -o StrictHostKeyChecking=no ubuntu@192.168.30.210 "resolvectl dns ens3 && resolvectl status ens3 | grep -E 'Current DNS|DNS Servers'"
