@@ -63,16 +63,6 @@ def send_email(subject, body):
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
-    print("\n" + "=" * 70)
-    print("DNS SETTING ALTERED NOTIFICATION EMAIL")
-    print("=" * 70)
-    print(f"From    : {FROM_EMAIL}")
-    print(f"To      : {TO_EMAIL}")
-    print(f"Subject : {subject}")
-    print("-" * 70)
-    print(body)
-    print("=" * 70)
-
     if not SEND_EMAIL or not SMTP_SERVER:
         print(
             "\n[DRY RUN] Email displayed (startup SMTP not configured / SEND_EMAIL unset)."
