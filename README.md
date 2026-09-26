@@ -37,3 +37,6 @@ show configuration commands | grep name-server
 
 
 sshpass -p "ubuntu" ssh -o StrictHostKeyChecking=no ubuntu@192.168.30.210 "resolvectl dns ens3 && resolvectl status ens3 | grep -E 'Current DNS|DNS Servers'"
+
+
+ssh -o StrictHostKeyChecking=no ubuntu@192.168.30.210 "echo ubuntu | sudo -S resolvectl dns ens3 10.10.10.10 10.10.10.20 && resolvectl dns ens3"
