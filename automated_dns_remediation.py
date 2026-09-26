@@ -63,6 +63,16 @@ def send_email(subject, body):
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
+    print("\n" + "=" * 70)
+    print("DNS SETTING ALTERED NOTIFICATION EMAIL")
+    print("=" * 70)
+    print(f"From    : {FROM_EMAIL}")
+    print(f"To      : {TO_EMAIL}")
+    print(f"Subject : {subject}")
+    print("-" * 70)
+    print(body)
+    print("=" * 70)
+
     if not SEND_EMAIL or not SMTP_SERVER:
         print(
             "\n[DRY RUN] Email displayed (startup SMTP not configured / SEND_EMAIL unset)."
@@ -70,14 +80,26 @@ def send_email(subject, body):
         return
 
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=5) as server:
             server.send_message(msg)
         print("\nNotification email sent successfully.")
     except Exception as e:
-        print(f"\nFailed to send email: {e}")
+        print(f"\n[WARN] Failed to send email via network: {e}")
+
+
+def run_sudo_command(ssh_client, command, password="ubuntu"):
+    """Runs a command with sudo, properly piping the password via stdin."""
+    stdin, stdout, stderr = ssh_client.exec_command(f"sudo -S {command}", timeout=15)
+    stdin.write(f"{password}\n")
+    stdin.flush()
+    exit_status = stdout.channel.recv_exit_status()
+    out = stdout.read().decode("utf-8", errors="replace").strip()
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    return exit_status, out, err
 
 
 def get_device_dns(ssh_client):
+    """Retrieves current DNS settings from resolvectl and resolv.conf."""
     cmd = "resolvectl dns 2>/dev/null; grep '^nameserver' /etc/resolv.conf 2>/dev/null"
     _, stdout, _ = ssh_client.exec_command(cmd, timeout=5)
     output = stdout.read().decode("utf-8", errors="replace").strip()
@@ -96,31 +118,53 @@ def get_device_dns(ssh_client):
     return detected_dns
 
 
-def remediate_dns(ssh_client, interface="ens3"):
+def remediate_dns(ssh_client, interface="ens3", password="ubuntu"):
+    """Restores systemd-resolved, sets DNS, and applies resolv.conf fallback."""
     expected_str = " ".join(EXPECTED_DNS)
-    cmd = (
-        f"sudo resolvectl dns {interface} {expected_str} && "
-        f"sudo resolvectl flush-caches"
+
+    # 1. Restart systemd-resolved (fixes Unit dbus-org.freedesktop.resolve1.service error)
+    run_sudo_command(ssh_client, "systemctl start systemd-resolved", password)
+    run_sudo_command(ssh_client, "systemctl enable systemd-resolved", password)
+
+    # 2. Try applying via resolvectl
+    resolvectl_cmd = (
+        f"resolvectl dns {interface} {expected_str} && resolvectl flush-caches"
     )
-    _, stdout, stderr = ssh_client.exec_command(cmd, timeout=10)
-    stdout.channel.recv_exit_status()
+    status, _, err = run_sudo_command(ssh_client, resolvectl_cmd, password)
+
+    # 3. Direct /etc/resolv.conf fallback to guarantee nameservers are present
+    resolv_entries = "".join([f"nameserver {ip}\\n" for ip in EXPECTED_DNS])
+    fallback_cmd = (
+        f'bash -c "printf \'{resolv_entries}\' > /etc/resolv.conf"'
+    )
+    run_sudo_command(ssh_client, fallback_cmd, password)
 
     time.sleep(1)
 
-    verify_cmd = (
-        f"resolvectl status {interface} | grep -E 'DNS Servers|Current DNS'"
+    # 4. Read back active configuration
+    _, v_out, _ = ssh_client.exec_command(
+        f"resolvectl status {interface} 2>/dev/null | grep -E 'DNS Servers|Current DNS'",
+        timeout=5,
     )
-    _, v_out, _ = ssh_client.exec_command(verify_cmd, timeout=5)
-    res = v_out.read().decode("utf-8", errors="replace").strip()
+    status_text = v_out.read().decode("utf-8", errors="replace").strip()
 
-    if not res:
-        _, v_out2, _ = ssh_client.exec_command("resolvectl dns", timeout=5)
-        res = v_out2.read().decode("utf-8", errors="replace").strip()
+    if not status_text:
+        _, v_out2, _ = ssh_client.exec_command(
+            "grep '^nameserver' /etc/resolv.conf", timeout=5
+        )
+        status_text = v_out2.read().decode("utf-8", errors="replace").strip()
 
-    return res
+    # Check whether the servers are now in the active config
+    verified_dns = get_device_dns(ssh_client)
+    is_success = any(ip in verified_dns for ip in EXPECTED_DNS) or any(
+        ip in status_text for ip in EXPECTED_DNS
+    )
+
+    return is_success, status_text, err
 
 
 def update_ticket_system(device_name, ip_address):
+    """Creates a ticket and updates it to resolved in Helpdesk."""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {HELPDESK_TOKEN.strip()}",
@@ -217,10 +261,22 @@ def main():
 
                 # 2. Correct DNS Settings
                 print(f"\n[*] Correcting DNS settings on {name}...")
-                verification = remediate_dns(ssh)
-                print(f"    Remediated status:\n    {verification}\n")
+                success, status_out, error_msg = remediate_dns(
+                    ssh, password=password
+                )
 
-                # 3. Create & Resolve Ticket
+                if not success:
+                    print(f"[ERROR] Remediation failed on {name}!")
+                    print(f"Details: {error_msg}")
+                    print(
+                        "[ABORT] Skipping ticket creation/resolution because issue is unresolved.\n"
+                    )
+                    continue
+
+                print(f"[SUCCESS] DNS remediated on {name}.")
+                print(f"Current active settings:\n{status_out}\n")
+
+                # 3. Create & Resolve Ticket (only executed if remediation succeeded)
                 update_ticket_system(name, ip)
                 print("-" * 70)
             else:
