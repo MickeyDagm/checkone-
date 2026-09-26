@@ -1,5 +1,6 @@
 from datetime import datetime
-import email.utils
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import json
 import os
 import re
@@ -20,16 +21,18 @@ from config import (
     SMTP_SERVER,
     TO_EMAIL,
 )
-from enumerate_devices import CSV_FILE, enumerate_devices
 
-# Dynamically construct the ticket endpoint from the base URL
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from enumerate_devices import enumerate_devices
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_FILE = os.path.join(SCRIPT_DIR, "network_devices.csv")
 TICKET_URL = f"{HELPDESK_BASE_URL.rstrip('/')}/api/tickets"
+
 IP_PATTERN = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
 
-def send_email_alert(device_name, ip_address, detected_dns):
-    """Sends or displays the DNS Setting Altered Notification."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def build_altered_dns_email(device_name, ip_address, detected_dns, timestamp):
     detected_str = (
         ", ".join(detected_dns) if detected_dns else "None (Missing/Empty)"
     )
@@ -50,24 +53,31 @@ The system will attempt to automatically correct this configuration.
 
 Best regards,
 Network Monitoring System"""
+    return subject, body
+
+
+def send_email(subject, body):
+    msg = MIMEMultipart()
+    msg["From"] = FROM_EMAIL
+    msg["To"] = TO_EMAIL
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
 
     if not SEND_EMAIL or not SMTP_SERVER:
-        print("\n" + "=" * 20 + " EMAIL NOTIFICATION GENERATED " + "=" * 20)
-        print(f"To: {TO_EMAIL}\nFrom: {FROM_EMAIL}\nSubject: {subject}\n\n{body}")
-        print("=" * 66 + "\n")
+        print(
+            "\n[DRY RUN] Email displayed (startup SMTP not configured / SEND_EMAIL unset)."
+        )
         return
 
-    msg = f"From: {FROM_EMAIL}\r\nTo: {TO_EMAIL}\r\nSubject: {subject}\r\nDate: {email.utils.formatdate(localtime=True)}\r\n\r\n{body}"
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=5) as server:
-            server.sendmail(FROM_EMAIL, [TO_EMAIL], msg)
-        print(f"[EMAIL] Alert sent successfully: {subject}")
-    except Exception as exc:
-        print(f"[WARN] Failed to send email alert: {exc}", file=sys.stderr)
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
+            server.send_message(msg)
+        print("\nNotification email sent successfully.")
+    except Exception as e:
+        print(f"\nFailed to send email: {e}")
 
 
 def get_device_dns(ssh_client):
-    """Checks DNS settings from both resolvectl and resolv.conf."""
     cmd = "resolvectl dns 2>/dev/null; grep '^nameserver' /etc/resolv.conf 2>/dev/null"
     _, stdout, _ = ssh_client.exec_command(cmd, timeout=5)
     output = stdout.read().decode("utf-8", errors="replace").strip()
@@ -87,7 +97,6 @@ def get_device_dns(ssh_client):
 
 
 def remediate_dns(ssh_client, interface="ens3"):
-    """Corrects DNS settings via sudo resolvectl."""
     expected_str = " ".join(EXPECTED_DNS)
     cmd = (
         f"sudo resolvectl dns {interface} {expected_str} && "
@@ -98,51 +107,57 @@ def remediate_dns(ssh_client, interface="ens3"):
 
     time.sleep(1)
 
-    # Verify remediation
-    verify_cmd = f"resolvectl dns {interface}"
+    verify_cmd = (
+        f"resolvectl status {interface} | grep -E 'DNS Servers|Current DNS'"
+    )
     _, v_out, _ = ssh_client.exec_command(verify_cmd, timeout=5)
     res = v_out.read().decode("utf-8", errors="replace").strip()
+
+    if not res:
+        _, v_out2, _ = ssh_client.exec_command("resolvectl dns", timeout=5)
+        res = v_out2.read().decode("utf-8", errors="replace").strip()
+
     return res
 
 
-def create_and_resolve_ticket(device_name, ip_address):
-    """Creates a ticket for the altered DNS, then updates it to resolved."""
+def update_ticket_system(device_name, ip_address):
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {HELPDESK_TOKEN.strip()}",
     }
 
-    # 1. Create Ticket
-    create_payload = json.dumps({
+    # 1. Create ticket
+    payload_create = json.dumps({
         "title": f"DNS Configuration Altered - {device_name}",
         "description": f"DNS configuration altered on {device_name} ({ip_address}). Expected: {', '.join(EXPECTED_DNS)}.",
         "status": "open",
         "priority": "medium",
     }).encode("utf-8")
 
-    req = urllib.request.Request(
-        TICKET_URL, data=create_payload, headers=headers, method="POST"
+    req_create = urllib.request.Request(
+        TICKET_URL, data=payload_create, headers=headers, method="POST"
     )
 
     ticket_id = None
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req_create, timeout=5) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            resp_data = json.loads(raw)
             ticket_id = resp_data.get("id") or resp_data.get("ticket_id")
             print(f"[TICKET] Created ticket #{ticket_id} at {TICKET_URL} for {device_name}")
     except Exception as exc:
         print(f"[WARN] Failed to create ticket at {TICKET_URL}: {exc}", file=sys.stderr)
 
-    # 2. Resolve Ticket
+    # 2. Update to resolved
     if ticket_id:
         patch_url = f"{TICKET_URL}/{ticket_id}"
-        patch_payload = json.dumps({"status": "resolved"}).encode("utf-8")
+        payload_patch = json.dumps({"status": "resolved"}).encode("utf-8")
 
-        patch_req = urllib.request.Request(
-            patch_url, data=patch_payload, headers=headers, method="PATCH"
+        req_patch = urllib.request.Request(
+            patch_url, data=payload_patch, headers=headers, method="PATCH"
         )
         try:
-            with urllib.request.urlopen(patch_req, timeout=5) as resp:
+            with urllib.request.urlopen(req_patch, timeout=5) as resp:
                 print(
                     f"[TICKET] Updated ticket #{ticket_id} to status 'resolved' (HTTP {resp.status})"
                 )
@@ -151,9 +166,14 @@ def create_and_resolve_ticket(device_name, ip_address):
 
 
 def main():
-    print(f"[*] Helpdesk ticketing endpoint: {TICKET_URL}")
-    print("[*] Enumerating devices from CSV...")
+    print("=" * 70)
+    print("DNS CONFIGURATION MONITOR AND REMEDIATION")
+    print(f"Ticket Endpoint: {TICKET_URL}")
+    print(f"Expected DNS   : {', '.join(EXPECTED_DNS)}")
+    print("=" * 70)
+
     devices = enumerate_devices(CSV_FILE)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for dev in devices:
         name = dev["Device Name"].strip()
@@ -162,7 +182,6 @@ def main():
         user = dev.get("Username", "ubuntu").strip()
         password = dev.get("Password", "ubuntu").strip()
 
-        # Audit only valid Ubuntu clients/servers, skip authoritatives & SMTP
         if os_type != "ubuntu" or not IP_PATTERN.match(ip):
             continue
         if name.upper() in ["DNS1", "DNS2", "SMTP"]:
@@ -186,25 +205,26 @@ def main():
             is_compliant = all(srv in current_dns for srv in EXPECTED_DNS)
 
             if not is_compliant:
-                print(
-                    f"\n[!] ALERT: DNS configuration altered on {name} ({ip})!"
+                print(f"\n[!] ALERT: DNS configuration altered on {name} ({ip})!")
+                print(f"    Detected : {current_dns}")
+                print(f"    Expected : {EXPECTED_DNS}")
+
+                # 1. Send / Display Email Template
+                subject, body = build_altered_dns_email(
+                    name, ip, current_dns, timestamp
                 )
-                print(f"    Current : {current_dns}")
-                print(f"    Expected: {EXPECTED_DNS}")
+                send_email(subject, body)
 
-                # 1. Email notification
-                send_email_alert(name, ip, current_dns)
+                # 2. Correct DNS Settings
+                print(f"\n[*] Correcting DNS settings on {name}...")
+                verification = remediate_dns(ssh)
+                print(f"    Remediated status:\n    {verification}\n")
 
-                # 2. Remediate DNS
-                print(f"[*] Correcting DNS on {name}...")
-                status = remediate_dns(ssh)
-                print(f"    Remediated status: {status}")
-
-                # 3. Update Web Ticket Service
-                create_and_resolve_ticket(name, ip)
-                print("-" * 50)
+                # 3. Create & Resolve Ticket
+                update_ticket_system(name, ip)
+                print("-" * 70)
             else:
-                print(f"[OK] {name} ({ip}) DNS is compliant.")
+                print(f"[OK] {name:<8} | {ip:<16} | DNS is compliant.")
 
         except Exception as err:
             print(f"[-] Could not connect to {name} ({ip}): {err}")
